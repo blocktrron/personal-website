@@ -1,0 +1,5 @@
+site_name: Bamboo Palace
+theme:
+  name: material
+plugins:
+  - privacy

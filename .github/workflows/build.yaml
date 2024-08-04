@@ -1,0 +1,175 @@
+name: Build Homepage
+on: [ push, pull_request]
+jobs:
+  build-homepage:
+    name: build-homepage
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/squidfunk/mkdocs-material:9.5.31
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Build with MkDocs
+        run: |
+          cd homepage && mkdocs build
+      - name: Save rendered homepage
+        uses: actions/upload-artifact@v4
+        with:
+          path: homepage/site
+          name: homepage
+  build-meta:
+    name: build-meta
+    runs-on: ubuntu-24.04
+    outputs:
+      deploy: >-
+        ${{ steps.build-metadata.outputs.deploy }}
+      version:
+        ${{ steps.build-metadata.outputs.version }}
+      sdk-name:
+        ${{ steps.build-metadata.outputs.sdk-name }}
+      sdk-url:
+        ${{ steps.build-metadata.outputs.sdk-url }}
+      imagebuilder-name:
+        ${{ steps.build-metadata.outputs.imagebuilder-name }}
+      imagebuilder-url:
+        ${{ steps.build-metadata.outputs.imagebuilder-url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+          submodules: true
+      - name: Get CI build meta
+        id: build-metadata
+        run: bash $GITHUB_WORKSPACE/contrib/ci-meta.sh
+  build-packages:
+    name: build-packages
+    runs-on: ubuntu-24.04
+    needs:
+      - build-meta
+      - build-homepage
+    outputs:
+      usign-public-key:
+        ${{ steps.build-keypair.outputs.usign-public-key }}
+      usign-fingerprint:
+        ${{ steps.build-keypair.outputs.usign-fingerprint }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+          submodules: true
+      - name: Install dependencies
+        run: |
+          $GITHUB_WORKSPACE/contrib/install-deps.sh
+      - name: Download SDK
+        run: |
+          curl -o /tmp/openwrt-sdk.tar.xz ${{ needs.build-meta.outputs.sdk-url }}
+      - name: Extract SDK
+        run: |
+          tar -xf /tmp/openwrt-sdk.tar.xz -C /tmp
+          ls /tmp
+          mv /tmp/${{ needs.build-meta.outputs.sdk-name }} /tmp/openwrt-sdk
+      - name: Create feeds.conf
+        run: |
+          echo "src-link homepage $GITHUB_WORKSPACE" > /tmp/openwrt-sdk/feeds.conf
+      - name: Install SDK feeds
+        if: steps.restore-cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp/openwrt-sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+      - name: Get build keypair
+        id: build-keypair
+        run: |
+          bash $GITHUB_WORKSPACE/contrib/build-key.sh /tmp/openwrt-sdk/staging_dir/host/bin/usign
+      - name: Save secret build-key
+        run: |
+          echo "${{ steps.build-keypair.outputs.usign-private-key }}" > /tmp/openwrt-sdk/key-build
+      - name: Create SDK configuration
+        run: |
+          make -C /tmp/openwrt-sdk defconfig
+      - name: Extract rendered homepage
+        uses: actions/download-artifact@v4
+        with:
+          name: homepage
+          path: packages/homepage-content/files/
+      - name: Build packages
+        run: |
+          make -C /tmp/openwrt-sdk package/homepage-core/compile V=s -j4
+          make -C /tmp/openwrt-sdk package/homepage-content/compile V=s -j4
+      - name: Generate package index
+        run: |
+          make -C /tmp/openwrt-sdk package/index V=s
+      - name: Upload Homepage packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-homepage
+          path: /tmp/openwrt-sdk/bin/packages/x86_64/homepage
+  build-firmware:
+    name: build-firmware
+    runs-on: ubuntu-24.04
+    needs: [build-packages, build-meta]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/packages
+      - name: Show binary output directory structure
+        run: |
+          tree /tmp/packages
+      - name: Install dependencies
+        run: |
+            $GITHUB_WORKSPACE/contrib/install-deps.sh
+      - name: Download Imagebuilder
+        run: |
+          curl -o /tmp/openwrt-imagebuilder.tar.xz ${{ needs.build-meta.outputs.imagebuilder-url }}
+      - name: Extract Imagebuilder
+        run: |
+          tar -xf /tmp/openwrt-imagebuilder.tar.xz -C /tmp
+          mv /tmp/${{ needs.build-meta.outputs.imagebuilder-name }} /tmp/openwrt-imagebuilder
+      - name: Save public build-key
+        run: |
+          echo "${{ needs.build-packages.outputs.usign-public-key }}" > /tmp/openwrt-imagebuilder/keys/${{ needs.build-packages.outputs.usign-fingerprint }}
+      - name: Link repositories
+        run: |
+          echo "src homepage file:///tmp/packages/packages-homepage" >> /tmp/openwrt-imagebuilder/repositories.conf
+      - name: Build images
+        run: |
+          cd /tmp/openwrt-imagebuilder
+          $GITHUB_WORKSPACE/contrib/build-image.sh
+      - name: Upload firmware images
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-images
+          path: /tmp/openwrt-imagebuilder/bin/targets/x86/64
+  deploy-homepage:
+    name: deploy-homepage
+    runs-on: ubuntu-24.04
+    needs: [build-packages, build-firmware, build-meta]
+    if: ${{ needs.build-meta.outputs.deploy == '1' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-images
+          path: /tmp/artifacts
+      - name: Show binary output directory structure
+        run: |
+          tree /tmp/artifacts
+      - name: Save SSH Private Key
+        run: |
+          echo "${{ secrets.SSH_DEPLOY_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+      - name: Copy Firmware to Server
+        run: |
+          scp -O -i /tmp/deploy_key -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no /tmp/artifacts/openwrt-23.05.4-x86-64-generic-squashfs-combined.img.gz root@panda.blocktrron.ovh:/tmp/upgrade.bin
+      - name: Install Firmware
+        run: |
+          ssh -i /tmp/deploy_key -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@panda.blocktrron.ovh "sysupgrade -n /tmp/upgrade.bin || true"
